@@ -158,6 +158,45 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("push url = %q", got)
 		}
 	})
+	t.Run("a global https-to-ssh rewrite cannot reach the human's key", func(t *testing.T) {
+		const key = "url.git@github.com:.insteadOf"
+		const pushKey = "url.git@github.com:.pushInsteadOf"
+		run("", "git", "config", "--global", key, "https://github.com/")
+		run("", "git", "config", "--global", pushKey, "https://github.com/")
+		for _, remote := range []string{"https://github.com/acme/widgets.git", "git@github.com:acme/widgets.git", "ssh://git@github.com/acme/widgets.git"} {
+			run("", "git", "remote", "set-url", "origin", remote)
+			for _, dir := range []string{"--all", "--push"} {
+				if got := run("", bin, "exec", "--", "git", "remote", "get-url", dir, "origin"); got != "https://github.com/acme/widgets.git" {
+					t.Errorf("%s %s -> %q", remote, dir, got)
+				}
+			}
+		}
+		// Another owner is still rewritten to SSH: it must fail rather than connect.
+		cmd := exec.Command(bin, "exec", "--", "git", "ls-remote", "https://github.com/other/repo.git")
+		cmd.Dir, cmd.Env = repo, env
+		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "SSH is disabled") {
+			t.Errorf("ls-remote: %v: %s", err, out)
+		}
+		// setup-git must hold without exec's environment too.
+		run("", bin, "setup-git")
+		if got := run("", "git", "remote", "get-url", "--push", "origin"); got != "https://github.com/acme/widgets.git" {
+			t.Errorf("setup-git push url = %q", got)
+		}
+		cmd = exec.Command("git", "ls-remote", "https://github.com/other/repo.git")
+		cmd.Dir, cmd.Env = repo, env
+		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "SSH is disabled") {
+			t.Errorf("setup-git ls-remote: %v: %s", err, out)
+		}
+		run("", bin, "setup-git", "--undo")
+		cmd = exec.Command("git", "config", "--local", "core.sshCommand")
+		cmd.Dir, cmd.Env = repo, env
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Errorf("undo left core.sshCommand = %s", out)
+		}
+		run("", "git", "config", "--global", "--unset", key)
+		run("", "git", "config", "--global", "--unset", pushKey)
+		run("", "git", "remote", "set-url", "origin", "git@github.com:acme/widgets.git")
+	})
 	t.Run("exec git uses app credential, not the human's", func(t *testing.T) {
 		got := run("protocol=https\nhost=github.com\npath=acme/widgets.git\n\n", bin, "exec", "--", "git", "credential", "fill")
 		if !strings.Contains(got, "username=x-access-token") || !strings.Contains(got, "password=ghs_fake") {

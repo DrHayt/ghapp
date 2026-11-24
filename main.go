@@ -129,6 +129,9 @@ func credentialGet(c *client, in io.Reader, out io.Writer) error {
 	return err
 }
 
+// sshBlocked replaces ssh; the trailing # drops the arguments git appends.
+const sshBlocked = "echo 'ghapp: SSH is disabled so the human key is never used; use an https remote' >&2; exit 1 #"
+
 // DECISION: hand the token to stock git/gh rather than commit via the API
 // (see docs/decisions/0001-inject-app-token-into-stock-git-and-gh.md).
 // gitSettings are the config entries that route git's GitHub traffic through the app.
@@ -140,13 +143,27 @@ func gitSettings(c *client) ([][2]string, error) {
 		return nil, err
 	}
 	base := "https://" + c.cfg.Host
-	return [][2]string{
+	settings := [][2]string{
+		// Fail closed: if any rewrite below is beaten, SSH must not use the human's key.
+		{"core.sshCommand", sshBlocked},
 		{"credential." + base + ".helper", ""},
 		{"credential." + base + ".helper", "!'" + strings.ReplaceAll(self, "'", `'\''`) + "' git-credential"},
 		{"credential." + base + ".useHttpPath", "true"},
 		{"url." + base + "/.insteadOf", "git@" + c.cfg.Host + ":"},
 		{"url." + base + "/.insteadOf", "ssh://git@" + c.cfg.Host + "/"},
-	}, nil
+	}
+	// The human may rewrite https://host/ to SSH globally. Git prefers the longest
+	// match, so rules that include the owner win. pushInsteadOf beats insteadOf on
+	// push, so it needs the same rules.
+	if owner, _ := originRepo(c.cfg.Host); owner != "" {
+		target := base + "/" + owner + "/"
+		for _, from := range []string{target, "git@" + c.cfg.Host + ":" + owner + "/", "ssh://git@" + c.cfg.Host + "/" + owner + "/"} {
+			settings = append(settings,
+				[2]string{"url." + target + ".insteadOf", from},
+				[2]string{"url." + target + ".pushInsteadOf", from})
+		}
+	}
+	return settings, nil
 }
 
 func execAs(c *client, argv []string) error {
@@ -173,6 +190,7 @@ func execAs(c *client, argv []string) error {
 	}
 	env = append(env,
 		fmt.Sprintf("GIT_CONFIG_COUNT=%d", n),
+		"GIT_SSH_COMMAND="+sshBlocked,
 		"GH_TOKEN="+t.Token,
 		"GITHUB_TOKEN="+t.Token,
 		"GIT_AUTHOR_NAME="+id.Name, "GIT_AUTHOR_EMAIL="+id.Email,
@@ -227,7 +245,11 @@ func setupGit(c *client, undo bool) error {
 	}
 	for _, k := range keys {
 		// exit status 5 just means the key wasn't set
-		_ = exec.Command("git", "config", "--local", "--unset-all", k).Run()
+		args := []string{"config", "--local", "--unset-all", k}
+		if k == "core.sshCommand" {
+			args = []string{"config", "--local", "--fixed-value", "--unset-all", k, sshBlocked}
+		}
+		_ = exec.Command("git", args...).Run()
 	}
 	if undo {
 		fmt.Println("ghapp: removed app git config from this repo")

@@ -113,6 +113,8 @@ Other agents work the same way: run their git/gh calls through `ghapp exec --`, 
 
 ## Limitations
 
+- SSH is disabled for git under `exec` and `setup-git`, so a config that rewrites HTTPS to
+  SSH fails instead of using your key. SSH remotes on other hosts don't work there.
 - Commits are **not signed**, so GitHub won't show them as "Verified". Branches that require
   signed commits will reject the push. See [ADR 0001](docs/decisions/0001-inject-app-token-into-stock-git-and-gh.md).
 - The app can only reach repos it is installed on, with the permissions you granted. That's the point.

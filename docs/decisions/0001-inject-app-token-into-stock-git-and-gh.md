@@ -21,7 +21,15 @@ installation tokens (JWT → `/app/installations/{id}/access_tokens`, cached unt
   so SSH keys are skipped.
 - `ghapp setup-git` writes the same settings into one repo's `.git/config`.
 
+- SSH is disabled for git and owner-specific URL rules are added (2026-11-23),
+  because a global `url.git@github.com:.insteadOf=https://github.com/` defeated the
+  plain rewrite and a push went out with the human's SSH key.
+
 ## Rejected alternatives
+- **Relying on URL rewriting alone to avoid SSH:** rejected because git config can
+  always contain a longer or earlier rule; the fallback has to fail closed.
+- **Blocking SSH only to github.com:** rejected because SSH host aliases hide the
+  real host.
 - **Create commits through the GitHub API (Git Data / GraphQL `createCommitOnBranch`):**
   rejected because agents would need a custom commit command instead of `git`.
   It breaks on large or binary changes and on multi-commit histories, and local
