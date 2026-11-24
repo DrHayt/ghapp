@@ -166,17 +166,27 @@ func undoSetup(c *client, path string) error {
 	if err := json.Unmarshal(b, &st); err != nil {
 		return fmt.Errorf("parse %s: %w", path, err)
 	}
-	// Keys already at their prior values (setup or undo was interrupted) are done.
-	intact := map[string]bool{}
+	// If a key holds a leading part of its prior values, then setup hadn't replaced
+	// it yet or an earlier undo was interrupted while restoring it. Only add the rest:
+	// removing "ours" could drop a prior value that happens to be equal.
+	restoring := map[string]bool{}
 	for k, prev := range st.Previous {
 		cur, err := localValues(k)
 		if err != nil {
 			return err
 		}
-		intact[k] = slices.Equal(cur, prev)
+		if len(cur) > len(prev) || !slices.Equal(cur, prev[:len(cur)]) {
+			continue
+		}
+		restoring[k] = true
+		for _, v := range prev[len(cur):] {
+			if _, err := localConfig("--add", k, v); err != nil {
+				return err
+			}
+		}
 	}
 	for _, kv := range st.Added {
-		if intact[kv[0]] {
+		if restoring[kv[0]] {
 			continue
 		}
 		if _, err := localConfig("--fixed-value", "--unset-all", kv[0], kv[1]); err != nil {
@@ -184,6 +194,9 @@ func undoSetup(c *client, path string) error {
 		}
 	}
 	for k, prev := range st.Previous {
+		if restoring[k] {
+			continue
+		}
 		left, err := localValues(k)
 		if err != nil {
 			return err

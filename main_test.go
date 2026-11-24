@@ -332,6 +332,46 @@ func TestEndToEnd(t *testing.T) {
 			t.Errorf("before:\n%s\nafter:\n%s", before, after)
 		}
 	})
+	t.Run("undo can be retried after interruption at any point", func(t *testing.T) {
+		const key = "credential.https://github.com.helper"
+		record := filepath.Join(repo, ".git", "ghapp-setup.json")
+		set := func(vals ...string) {
+			t.Helper()
+			cmd := exec.Command("git", "config", "--unset-all", key)
+			cmd.Dir, cmd.Env = repo, env
+			cmd.Run() // may already be unset
+			for _, v := range vals {
+				run("", "git", "config", "--add", key, v)
+			}
+		}
+		prev := []string{"", "mine", "backup"}
+		set(prev...)
+		before := localList()
+		run("", bin, "setup-git")
+		b, err := os.ReadFile(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ours := "!'" + bin + "' git-credential"
+		if out := run("", "git", "config", "--get-all", key); !strings.Contains(out, "git-credential") {
+			t.Fatalf("helper = %q", out)
+		} else {
+			ours = out[strings.Index(out, "!"):]
+		}
+		run("", bin, "setup-git", "--undo")
+		// Restoration stopped after n values, or removal stopped midway.
+		for _, state := range [][]string{{}, prev[:1], prev[:2], prev, {"", ours}, {ours}} {
+			set(state...)
+			if err := os.WriteFile(record, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			run("", bin, "setup-git", "--undo")
+			if after := localList(); after != before {
+				t.Errorf("from %q\nbefore:\n%s\nafter:\n%s", state, before, after)
+			}
+		}
+		set("", "mine")
+	})
 	t.Run("concurrent setup and undo keep the original config", func(t *testing.T) {
 		before := localList()
 		var wg sync.WaitGroup
