@@ -145,6 +145,8 @@ func gitSettings(c *client) ([][2]string, error) {
 	base := "https://" + c.cfg.Host
 	settings := [][2]string{
 		// Fail closed: if any rewrite below is beaten, SSH must not use the human's key.
+		// An inherited GIT_SSH_COMMAND outranks core.sshCommand, hence both.
+		{"protocol.ssh.allow", "never"},
 		{"core.sshCommand", sshBlocked},
 		{"credential." + base + ".helper", ""},
 		{"credential." + base + ".helper", "!'" + strings.ReplaceAll(self, "'", `'\''`) + "' git-credential"},
@@ -232,41 +234,6 @@ func (w *tailWriter) Write(p []byte) (int, error) {
 		w.b = append([]byte(nil), w.b[len(w.b)-limit:]...)
 	}
 	return len(p), nil
-}
-
-func setupGit(c *client, undo bool) error {
-	settings, err := gitSettings(c)
-	if err != nil {
-		return err
-	}
-	keys := []string{"user.name", "user.email"}
-	for _, kv := range settings {
-		keys = append(keys, kv[0])
-	}
-	for _, k := range keys {
-		// exit status 5 just means the key wasn't set
-		args := []string{"config", "--local", "--unset-all", k}
-		if k == "core.sshCommand" {
-			args = []string{"config", "--local", "--fixed-value", "--unset-all", k, sshBlocked}
-		}
-		_ = exec.Command("git", args...).Run()
-	}
-	if undo {
-		fmt.Println("ghapp: removed app git config from this repo")
-		return nil
-	}
-	id, err := c.botIdentity()
-	if err != nil {
-		return err
-	}
-	settings = append(settings, [2]string{"user.name", id.Name}, [2]string{"user.email", id.Email})
-	for _, kv := range settings {
-		if out, err := exec.Command("git", "config", "--local", "--add", kv[0], kv[1]).CombinedOutput(); err != nil {
-			return fmt.Errorf("git config %s: %v: %s", kv[0], err, out)
-		}
-	}
-	fmt.Printf("ghapp: git in this repo now commits and pushes as %s <%s>\n", id.Name, id.Email)
-	return nil
 }
 
 // originRepo returns owner/repo of the current directory's origin remote, if it is on host.

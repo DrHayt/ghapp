@@ -14,7 +14,7 @@ import (
 type resource struct {
 	path string            // below /repos/{owner}/{repo}/; {} is the argument
 	arg  string            // "number", "ref", or "" for none
-	list string            // "": single object; "[]": bare array; else the array's key
+	list string            // "": single object; "[]": bare array; else the array's key ("*key" keeps the rest of the object)
 	perm map[string]string // the only permissions the token is minted with
 }
 
@@ -34,7 +34,7 @@ var resources = map[string]resource{
 	"issue":           {"issues/{}", "number", "", readPerm("issues")},
 	"issue-comments":  {"issues/{}/comments", "number", "[]", readPerm("issues")},
 	"checks":          {"commits/{}/check-runs", "ref", "check_runs", readPerm("checks")},
-	"status":          {"commits/{}/status", "ref", "", readPerm("statuses")},
+	"status":          {"commits/{}/status", "ref", "*statuses", readPerm("statuses")},
 	"run":             {"actions/runs/{}", "number", "", readPerm("actions")},
 	"run-jobs":        {"actions/runs/{}/jobs", "number", "jobs", readPerm("actions")},
 	"job-log":         {"actions/jobs/{}/logs", "number", "raw", readPerm("actions")},
@@ -126,6 +126,7 @@ func read(c *client, args []string, out io.Writer) error {
 		}
 		return enc.Encode(v)
 	}
+	key, keep := strings.CutPrefix(res.list, "*")
 	all := []json.RawMessage{}
 	for page := 1; ; page++ {
 		var items []json.RawMessage
@@ -138,13 +139,19 @@ func read(c *client, args []string, out io.Writer) error {
 			return err
 		}
 		if res.list != "[]" {
-			if err := json.Unmarshal(obj[res.list], &items); err != nil {
+			if err := json.Unmarshal(obj[key], &items); err != nil {
 				return fmt.Errorf("unexpected response from %s: %w", path, err)
 			}
 		}
 		all = append(all, items...)
 		if len(items) < 100 {
-			return enc.Encode(all)
+			if !keep {
+				return enc.Encode(all)
+			}
+			if obj[key], err = json.Marshal(all); err != nil {
+				return err
+			}
+			return enc.Encode(obj)
 		}
 	}
 }

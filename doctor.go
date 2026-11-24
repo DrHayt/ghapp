@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -18,7 +20,7 @@ type need struct {
 var needs = []need{
 	{"metadata", "read", true, "everything"},
 	{"contents", "write", true, "pushing branches"},
-	{"pull_requests", "write", true, "opening and reading pull requests"},
+	{"pull_requests", "write", true, "opening and updating pull requests"},
 	{"checks", "read", true, "reading CI check results"},
 	{"actions", "read", true, "reading Actions runs and job logs"},
 	{"statuses", "read", false, "reading commit statuses (gh pr checks, some CI systems)"},
@@ -98,7 +100,9 @@ func doctor(c *client, owner, repo string, out io.Writer) error {
 		fmt.Fprintf(out, "Then accept them for the installation: %s\n", inst.HTMLURL)
 	}
 	// A cached token keeps the permissions it was minted with.
-	if err := os.Remove(c.tokenCache(id)); err == nil {
+	if err := os.Remove(c.tokenCache(id)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("ghapp doctor: cached token not cleared, exec may keep using old permissions: %w", err)
+	} else if err == nil {
 		fmt.Fprintln(out, "Cleared the cached token, so permission changes apply to the next command.")
 	}
 	if bad {
@@ -115,23 +119,87 @@ func permissionHint(argv []string, stderr string) string {
 	case strings.Contains(low, "refusing to allow a github app") && strings.Contains(low, "workflow"):
 		perm = "Workflows: write"
 	case strings.Contains(low, "resource not accessible by integration"):
-		cmd := strings.ToLower(strings.Join(argv, " "))
-		switch {
-		case strings.Contains(cmd, "check") || strings.Contains(cmd, "status"):
-			perm = "Checks: read (and Commit statuses: read)"
-		case strings.Contains(cmd, "/actions/") || strings.Contains(cmd, "gh run ") || strings.Contains(cmd, "gh workflow "):
-			perm = "Actions: read (write to re-run or cancel)"
-		case strings.Contains(cmd, "gh pr ") || strings.Contains(cmd, "/pulls"):
-			perm = "Pull requests: write"
-		case strings.Contains(cmd, "gh issue ") || strings.Contains(cmd, "/issues"):
-			perm = "Issues: write (or read, to view)"
-		default:
-			perm = "unknown"
-		}
+		perm = commandPermission(argv)
 	default:
 		return ""
 	}
 	return "ghapp: the app probably lacks a permission: " + perm
+}
+
+const (
+	permChecks  = "Checks: read (and Commit statuses: read)"
+	permActions = "Actions: read to view, write to re-run or cancel"
+	permPulls   = "Pull requests: read to view, write to change"
+	permIssues  = "Issues: read to view, write to change"
+	permUnknown = "unknown"
+)
+
+// commandPermission looks only at the gh subcommand or API endpoint, never at
+// repository names, titles, or other argument values.
+func commandPermission(argv []string) string {
+	if len(argv) < 2 || filepath.Base(argv[0]) != "gh" {
+		return permUnknown
+	}
+	switch argv[1] {
+	case "run", "workflow":
+		return permActions
+	case "issue":
+		return permIssues
+	case "pr":
+		if len(argv) > 2 && argv[2] == "checks" {
+			return permChecks
+		}
+		return permPulls
+	case "api":
+		return endpointPermission(apiEndpoint(argv[2:]))
+	}
+	return permUnknown
+}
+
+// apiEndpoint returns the positional argument of `gh api`.
+func apiEndpoint(args []string) string {
+	takesValue := map[string]bool{"-X": true, "--method": true, "-f": true, "--raw-field": true,
+		"-F": true, "--field": true, "-H": true, "--header": true, "-q": true, "--jq": true,
+		"-t": true, "--template": true, "--input": true, "--hostname": true,
+		"-p": true, "--preview": true, "--cache": true}
+	for i := 0; i < len(args); i++ {
+		if takesValue[args[i]] {
+			i++
+		} else if !strings.HasPrefix(args[i], "-") {
+			return args[i]
+		}
+	}
+	return ""
+}
+
+func endpointPermission(endpoint string) string {
+	endpoint, _, _ = strings.Cut(endpoint, "?")
+	if _, rest, ok := strings.Cut(endpoint, "://"); ok {
+		_, endpoint, _ = strings.Cut(rest, "/")
+	}
+	p := strings.Split(strings.Trim(endpoint, "/"), "/")
+	if len(p) < 4 || p[0] != "repos" {
+		return permUnknown
+	}
+	p = p[3:] // drop repos/{owner}/{repo}
+	switch p[0] {
+	case "actions":
+		return permActions
+	case "pulls":
+		return permPulls
+	case "issues":
+		return permIssues
+	case "check-runs", "check-suites", "statuses":
+		return permChecks
+	case "commits":
+		if len(p) > 2 {
+			switch p[len(p)-1] {
+			case "check-runs", "check-suites", "status", "statuses":
+				return permChecks
+			}
+		}
+	}
+	return permUnknown
 }
 
 // hint adds the place to grant it. Best effort: it never masks the real failure.

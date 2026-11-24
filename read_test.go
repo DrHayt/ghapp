@@ -67,6 +67,54 @@ func TestReadIsReducedAndPaginates(t *testing.T) {
 	}
 }
 
+func TestReadStatusPaginatesAndKeepsState(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/installation") {
+			fmt.Fprint(w, `{"id":42}`)
+			return
+		}
+		if r.Method == "POST" {
+			fmt.Fprint(w, `{"token":"t"}`)
+			return
+		}
+		if r.URL.Query().Get("per_page") != "100" {
+			t.Error("not asking for full pages")
+		}
+		n := 100
+		if r.URL.Query().Get("page") == "2" {
+			n = 5
+		}
+		fmt.Fprintf(w, `{"state":"failure","total_count":105,"statuses":[%s]}`, strings.TrimSuffix(strings.Repeat(`{},`, n), ","))
+	})
+	var out bytes.Buffer
+	if err := read(c, []string{"status", "a/b", "main"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		State    string
+		Statuses []any
+	}
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil || got.State != "failure" || len(got.Statuses) != 105 {
+		t.Fatalf("%v %s %d", err, got.State, len(got.Statuses))
+	}
+}
+
+func TestDoctorReportsCacheFailure(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"id":42,"permissions":{"metadata":"read","contents":"write","pull_requests":"write","checks":"read","actions":"read"}}`)
+	})
+	if err := doctor(c, "a", "b", &bytes.Buffer{}); err != nil {
+		t.Fatalf("no cache should be fine: %v", err)
+	}
+	// A non-empty directory cannot be removed.
+	if err := os.MkdirAll(c.tokenCache("42")+"/x", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := doctor(c, "a", "b", &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "not cleared") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestReadRejectsBadArgs(t *testing.T) {
 	for _, a := range []string{"", "nope a/b 1", "pr a/b", "pr a/b 1 2", "pr a/b 1/merge", "pr a/.. 1",
 		"pr a/b/c 1", "pr a/b 1?x=y", "checks a/b ../../x", "checks a/b -x", "prs a/b --method=POST"} {
@@ -135,6 +183,12 @@ func TestPermissionHint(t *testing.T) {
 		{"gh run view 1", denied, "Actions: read"},
 		{"git push", "! [remote rejected] refusing to allow a GitHub App to create or update workflow `.github/workflows/x.yml` without `workflows` permission", "Workflows: write"},
 		{"git push", "fatal: unrelated", ""},
+		{"gh run view 1 --repo acme/check-service", denied, "Actions: read"},
+		{"gh pr create --title status", denied, "Pull requests: read to view"},
+		{"gh api -X GET repos/acme/checks/pulls/1?x=check", denied, "Pull requests: read to view"},
+		{"gh api /repos/a/b/commits/feat/x/check-runs", denied, "Checks: read"},
+		{"gh api https://api.github.com/repos/a/b/actions/runs --jq .status", denied, "Actions: read"},
+		{"gh api graphql -f query=checks", denied, "unknown"},
 	} {
 		got := permissionHint(strings.Fields(tc.cmd), tc.stderr)
 		if (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
