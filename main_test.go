@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -246,6 +247,20 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("after undo expected the human helper back, got %q", got)
 		}
 	})
+	localList := func() string {
+		out := run("", "git", "config", "--local", "--get-regexp", `^(user|core\.sshcommand|protocol|credential|url)`)
+		lines := strings.Split(out, "\n")
+		// Order matters only among values of the same key.
+		sort.SliceStable(lines, func(i, j int) bool {
+			a, _, _ := strings.Cut(lines[i], " ")
+			b, _, _ := strings.Cut(lines[j], " ")
+			return a < b
+		})
+		for i := range lines { // run trims trailing space from the last line only
+			lines[i] = strings.TrimRight(lines[i], " ")
+		}
+		return strings.Join(lines, "\n")
+	}
 	t.Run("inherited GIT_SSH_COMMAND cannot bypass the SSH block", func(t *testing.T) {
 		run("", bin, "setup-git")
 		defer run("", bin, "setup-git", "--undo")
@@ -297,11 +312,59 @@ func TestEndToEnd(t *testing.T) {
 			t.Errorf("undo overwrote a later change: %q", got)
 		}
 	})
+	t.Run("undo of an unapplied record changes nothing", func(t *testing.T) {
+		record := filepath.Join(repo, ".git", "ghapp-setup.json")
+		run("", "git", "config", "--unset-all", "credential.https://github.com.helper")
+		run("", "git", "config", "--add", "credential.https://github.com.helper", "")
+		run("", "git", "config", "--add", "credential.https://github.com.helper", "mine")
+		before := localList()
+		run("", bin, "setup-git")
+		b, err := os.ReadFile(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run("", bin, "setup-git", "--undo")
+		if err := os.WriteFile(record, b, 0o600); err != nil { // as if interrupted before applying
+			t.Fatal(err)
+		}
+		run("", bin, "setup-git", "--undo")
+		if after := localList(); after != before {
+			t.Errorf("before:\n%s\nafter:\n%s", before, after)
+		}
+	})
+	t.Run("concurrent setup and undo keep the original config", func(t *testing.T) {
+		before := localList()
+		var wg sync.WaitGroup
+		for i := range 6 {
+			wg.Go(func() {
+				args := []string{"setup-git"}
+				if i%3 == 2 {
+					args = append(args, "--undo")
+				}
+				cmd := exec.Command(bin, args...)
+				cmd.Dir, cmd.Env = repo, env
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Errorf("%v: %v: %s", args, err, out)
+				}
+			})
+		}
+		wg.Wait()
+		run("", bin, "setup-git", "--undo")
+		if after := localList(); after != before {
+			t.Errorf("before:\n%s\nafter:\n%s", before, after)
+		}
+		if _, err := os.Stat(filepath.Join(repo, ".git", "ghapp-setup.json.lock")); err == nil {
+			t.Error("lock left behind")
+		}
+	})
 	t.Run("undo cleans up after versions without a record", func(t *testing.T) {
 		run("", bin, "setup-git")
 		os.Remove(filepath.Join(repo, ".git", "ghapp-setup.json"))
 		run("", "git", "remote", "set-url", "origin", "git@github.com:elsewhere/x.git")
-		run("", bin, "setup-git", "--undo")
+		if out := run("", bin, "setup-git", "--undo"); !strings.Contains(out, "--unset-all protocol.ssh.allow") {
+			t.Errorf("leftover SSH block not reported: %s", out)
+		}
+		run("", "git", "config", "--unset-all", "protocol.ssh.allow")
 		run("", "git", "remote", "set-url", "origin", "git@github.com:acme/widgets.git")
 		got := run("", "git", "config", "--local", "--list")
 		for _, bad := range []string{"acme/.", "git-credential", "[bot]", "ssh is disabled"} {

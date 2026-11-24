@@ -188,6 +188,9 @@ func TestPermissionHint(t *testing.T) {
 		{"gh api -X GET repos/acme/checks/pulls/1?x=check", denied, "Pull requests: read to view"},
 		{"gh api /repos/a/b/commits/feat/x/check-runs", denied, "Checks: read"},
 		{"gh api https://api.github.com/repos/a/b/actions/runs --jq .status", denied, "Actions: read"},
+		{"gh api -X POST repos/a/b/check-runs", denied, "Checks: read to view, write"},
+		{"gh api -X POST repos/a/b/statuses/abc", denied, "Commit statuses: read to view, write"},
+		{"gh api repos/a/b/commits/main/status", denied, "Commit statuses: read"},
 		{"gh api graphql -f query=checks", denied, "unknown"},
 	} {
 		got := permissionHint(strings.Fields(tc.cmd), tc.stderr)

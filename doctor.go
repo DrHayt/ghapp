@@ -127,11 +127,13 @@ func permissionHint(argv []string, stderr string) string {
 }
 
 const (
-	permChecks  = "Checks: read (and Commit statuses: read)"
-	permActions = "Actions: read to view, write to re-run or cancel"
-	permPulls   = "Pull requests: read to view, write to change"
-	permIssues  = "Issues: read to view, write to change"
-	permUnknown = "unknown"
+	permPRChecks = "Checks: read (and Commit statuses: read)"
+	permChecks   = "Checks: read to view, write to change"
+	permStatuses = "Commit statuses: read to view, write to change"
+	permActions  = "Actions: read to view, write to re-run or cancel"
+	permPulls    = "Pull requests: read to view, write to change"
+	permIssues   = "Issues: read to view, write to change"
+	permUnknown  = "unknown"
 )
 
 // commandPermission looks only at the gh subcommand or API endpoint, never at
@@ -147,7 +149,7 @@ func commandPermission(argv []string) string {
 		return permIssues
 	case "pr":
 		if len(argv) > 2 && argv[2] == "checks" {
-			return permChecks
+			return permPRChecks
 		}
 		return permPulls
 	case "api":
@@ -189,13 +191,17 @@ func endpointPermission(endpoint string) string {
 		return permPulls
 	case "issues":
 		return permIssues
-	case "check-runs", "check-suites", "statuses":
+	case "check-runs", "check-suites":
 		return permChecks
+	case "statuses":
+		return permStatuses
 	case "commits":
 		if len(p) > 2 {
 			switch p[len(p)-1] {
-			case "check-runs", "check-suites", "status", "statuses":
+			case "check-runs", "check-suites":
 				return permChecks
+			case "status", "statuses":
+				return permStatuses
 			}
 		}
 	}

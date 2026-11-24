@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 )
 
 // setupState records what setup-git changed, so undo doesn't depend on the
@@ -49,12 +50,37 @@ func localValues(key string) ([]string, error) {
 	return strings.Split(strings.TrimSuffix(out, "\x00"), "\x00"), nil
 }
 
+// lockSetup serializes setup and undo across all worktrees of a repo.
+func lockSetup(statePath string) (unlock func(), err error) {
+	path := statePath + ".lock"
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			f.Close()
+			return func() { os.Remove(path) }, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("ghapp setup-git: another setup or undo is running; if not, remove %s", path)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func setupGit(c *client, undo bool) error {
 	path, err := setupStatePath()
 	if err != nil {
 		return err
 	}
 	if undo {
+		unlock, err := lockSetup(path)
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		if err := undoSetup(c, path); err != nil {
 			return err
 		}
@@ -66,6 +92,11 @@ func setupGit(c *client, undo bool) error {
 	if err != nil {
 		return err
 	}
+	unlock, err := lockSetup(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := undoSetup(c, path); err != nil {
 		return err
 	}
@@ -101,7 +132,11 @@ func setupGit(c *client, undo bool) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, b, 0o600); err != nil {
+	// Rename, so an interrupted write can't leave an unreadable record.
+	if err := os.WriteFile(path+".tmp", b, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(path+".tmp", path); err != nil {
 		return err
 	}
 	for _, k := range replace {
@@ -131,7 +166,19 @@ func undoSetup(c *client, path string) error {
 	if err := json.Unmarshal(b, &st); err != nil {
 		return fmt.Errorf("parse %s: %w", path, err)
 	}
+	// Keys already at their prior values (setup or undo was interrupted) are done.
+	intact := map[string]bool{}
+	for k, prev := range st.Previous {
+		cur, err := localValues(k)
+		if err != nil {
+			return err
+		}
+		intact[k] = slices.Equal(cur, prev)
+	}
 	for _, kv := range st.Added {
+		if intact[kv[0]] {
+			continue
+		}
 		if _, err := localConfig("--fixed-value", "--unset-all", kv[0], kv[1]); err != nil {
 			return err
 		}
@@ -174,6 +221,14 @@ func undoUnrecorded(c *client) error {
 	}
 	if _, err := localConfig("--fixed-value", "--unset-all", "core.sshCommand", sshBlocked); err != nil {
 		return err
+	}
+	// Nothing proves ghapp set this one, and removing a human's own block would
+	// weaken their config, so report it instead.
+	if v, err := localValues("protocol.ssh.allow"); err != nil {
+		return err
+	} else if slices.Contains(v, "never") {
+		fmt.Fprintln(os.Stderr, "ghapp: no setup record found, so protocol.ssh.allow=never was left in place and SSH stays blocked."+
+			"\nghapp: if you didn't set it, run: git config --local --unset-all protocol.ssh.allow")
 	}
 	name, err := localValues("user.name")
 	if err != nil {
