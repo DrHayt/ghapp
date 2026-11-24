@@ -21,7 +21,19 @@ installation tokens (JWT → `/app/installations/{id}/access_tokens`, cached unt
   so SSH keys are skipped.
 - `ghapp setup-git` writes the same settings into one repo's `.git/config`.
 
+- SSH is disabled for git and owner-specific URL rules are added (2026-11-23),
+  because a global `url.git@github.com:.insteadOf=https://github.com/` defeated the
+  plain rewrite and a push went out with the human's SSH key.
+
+- `setup-git` records its changes in the git common dir so undo reverses exactly those.
+
 ## Rejected alternatives
+- **Derive undo from the current origin:** rejected because the origin can change
+  after setup, and replaced values such as `user.name` couldn't be restored.
+- **Relying on URL rewriting alone to avoid SSH:** rejected because git config can
+  always contain a longer or earlier rule; the fallback has to fail closed.
+- **Blocking SSH only to github.com:** rejected because SSH host aliases hide the
+  real host.
 - **Create commits through the GitHub API (Git Data / GraphQL `createCommitOnBranch`):**
   rejected because agents would need a custom commit command instead of `git`.
   It breaks on large or binary changes and on multi-commit histories, and local
@@ -46,5 +58,8 @@ installation tokens (JWT → `/app/installations/{id}/access_tokens`, cached unt
   Follow-up if needed: an API-based `ghapp commit` path, or SSH signing.
 - `setup-git` lasts until undone: a human pushing from that repo also acts as the
   app until they run `ghapp setup-git --undo`.
+- `setup-git`'s SSH block (`protocol.ssh.allow`, `core.sshCommand`) can be overridden by
+  exported `GIT_ALLOW_PROTOCOL` plus `GIT_SSH_COMMAND`; repo config can't prevent that.
+  `exec` is stricter because it sets `GIT_SSH_COMMAND` itself.
 - Changing workflow files (`.github/workflows/*`) requires the App to have the
   Workflows permission.

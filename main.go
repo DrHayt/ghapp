@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const usage = `ghapp — act as a GitHub App for git and gh
@@ -18,6 +19,9 @@ const usage = `ghapp — act as a GitHub App for git and gh
 Usage:
   ghapp exec -- <cmd> [args...]   run cmd with the app's token and bot identity
                                   (e.g. ghapp exec -- git push; ghapp exec -- gh pr create)
+  ghapp read <resource> <owner>/<repo> [number|ref]
+                                  fetch PR, issue, or CI data; GET only, read-only token
+  ghapp doctor [owner/repo]       list granted and missing app permissions
   ghapp setup-git [--undo]        make plain git in this repo commit/push as the app
   ghapp token [owner/repo]        print an installation token
   ghapp whoami                    print the app's bot name and email
@@ -85,6 +89,14 @@ func run(args []string) error {
 			return errors.New("ghapp exec: missing command")
 		}
 		return execAs(c, cmd)
+	case "read":
+		return read(c, args[1:], os.Stdout)
+	case "doctor":
+		owner, repo := originRepo(cfg.Host)
+		if len(args) > 1 {
+			owner, repo, _ = strings.Cut(args[1], "/")
+		}
+		return doctor(c, owner, repo, os.Stdout)
 	case "setup-git":
 		return setupGit(c, len(args) > 1 && args[1] == "--undo")
 	}
@@ -117,6 +129,9 @@ func credentialGet(c *client, in io.Reader, out io.Writer) error {
 	return err
 }
 
+// sshBlocked replaces ssh; the trailing # drops the arguments git appends.
+const sshBlocked = "echo 'ghapp: SSH is disabled so the human key is never used; use an https remote' >&2; exit 1 #"
+
 // DECISION: hand the token to stock git/gh rather than commit via the API
 // (see docs/decisions/0001-inject-app-token-into-stock-git-and-gh.md).
 // gitSettings are the config entries that route git's GitHub traffic through the app.
@@ -128,13 +143,29 @@ func gitSettings(c *client) ([][2]string, error) {
 		return nil, err
 	}
 	base := "https://" + c.cfg.Host
-	return [][2]string{
+	settings := [][2]string{
+		// Fail closed: if any rewrite below is beaten, SSH must not use the human's key.
+		// An inherited GIT_SSH_COMMAND outranks core.sshCommand, hence both.
+		{"protocol.ssh.allow", "never"},
+		{"core.sshCommand", sshBlocked},
 		{"credential." + base + ".helper", ""},
 		{"credential." + base + ".helper", "!'" + strings.ReplaceAll(self, "'", `'\''`) + "' git-credential"},
 		{"credential." + base + ".useHttpPath", "true"},
 		{"url." + base + "/.insteadOf", "git@" + c.cfg.Host + ":"},
 		{"url." + base + "/.insteadOf", "ssh://git@" + c.cfg.Host + "/"},
-	}, nil
+	}
+	// The human may rewrite https://host/ to SSH globally. Git prefers the longest
+	// match, so rules that include the owner win. pushInsteadOf beats insteadOf on
+	// push, so it needs the same rules.
+	if owner, _ := originRepo(c.cfg.Host); owner != "" {
+		target := base + "/" + owner + "/"
+		for _, from := range []string{target, "git@" + c.cfg.Host + ":" + owner + "/", "ssh://git@" + c.cfg.Host + "/" + owner + "/"} {
+			settings = append(settings,
+				[2]string{"url." + target + ".insteadOf", from},
+				[2]string{"url." + target + ".pushInsteadOf", from})
+		}
+	}
+	return settings, nil
 }
 
 func execAs(c *client, argv []string) error {
@@ -161,6 +192,7 @@ func execAs(c *client, argv []string) error {
 	}
 	env = append(env,
 		fmt.Sprintf("GIT_CONFIG_COUNT=%d", n),
+		"GIT_SSH_COMMAND="+sshBlocked,
 		"GH_TOKEN="+t.Token,
 		"GITHUB_TOKEN="+t.Token,
 		"GIT_AUTHOR_NAME="+id.Name, "GIT_AUTHOR_EMAIL="+id.Email,
@@ -172,38 +204,36 @@ func execAs(c *client, argv []string) error {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd.Run()
-}
-
-func setupGit(c *client, undo bool) error {
-	settings, err := gitSettings(c)
+	if fi, err := os.Stderr.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		return cmd.Run() // a human's terminal: keep progress bars and prompts working
+	}
+	// Agents run without a terminal; watch stderr so permission failures get explained.
+	tail := &tailWriter{}
+	cmd.Stderr = io.MultiWriter(os.Stderr, tail)
+	// Don't hang on background children (git maintenance) that inherit stderr.
+	cmd.WaitDelay = 2 * time.Second
+	err = cmd.Run()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		err = nil
+	}
 	if err != nil {
-		return err
-	}
-	keys := []string{"user.name", "user.email"}
-	for _, kv := range settings {
-		keys = append(keys, kv[0])
-	}
-	for _, k := range keys {
-		// exit status 5 just means the key wasn't set
-		_ = exec.Command("git", "config", "--local", "--unset-all", k).Run()
-	}
-	if undo {
-		fmt.Println("ghapp: removed app git config from this repo")
-		return nil
-	}
-	id, err := c.botIdentity()
-	if err != nil {
-		return err
-	}
-	settings = append(settings, [2]string{"user.name", id.Name}, [2]string{"user.email", id.Email})
-	for _, kv := range settings {
-		if out, err := exec.Command("git", "config", "--local", "--add", kv[0], kv[1]).CombinedOutput(); err != nil {
-			return fmt.Errorf("git config %s: %v: %s", kv[0], err, out)
+		if h := c.hint(argv, string(tail.b)); h != "" {
+			fmt.Fprintln(os.Stderr, h)
 		}
 	}
-	fmt.Printf("ghapp: git in this repo now commits and pushes as %s <%s>\n", id.Name, id.Email)
-	return nil
+	return err
+}
+
+// tailWriter keeps the last 64 KiB written to it.
+type tailWriter struct{ b []byte }
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	const limit = 64 << 10
+	w.b = append(w.b, p...)
+	if len(w.b) > limit {
+		w.b = append([]byte(nil), w.b[len(w.b)-limit:]...)
+	}
+	return len(p), nil
 }
 
 // originRepo returns owner/repo of the current directory's origin remote, if it is on host.

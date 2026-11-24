@@ -14,7 +14,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -158,10 +160,75 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("push url = %q", got)
 		}
 	})
+	t.Run("a global https-to-ssh rewrite cannot reach the human's key", func(t *testing.T) {
+		const key = "url.git@github.com:.insteadOf"
+		const pushKey = "url.git@github.com:.pushInsteadOf"
+		run("", "git", "config", "--global", key, "https://github.com/")
+		run("", "git", "config", "--global", pushKey, "https://github.com/")
+		for _, remote := range []string{"https://github.com/acme/widgets.git", "git@github.com:acme/widgets.git", "ssh://git@github.com/acme/widgets.git"} {
+			run("", "git", "remote", "set-url", "origin", remote)
+			for _, dir := range []string{"--all", "--push"} {
+				if got := run("", bin, "exec", "--", "git", "remote", "get-url", dir, "origin"); got != "https://github.com/acme/widgets.git" {
+					t.Errorf("%s %s -> %q", remote, dir, got)
+				}
+			}
+		}
+		// Another owner is still rewritten to SSH: it must fail rather than connect.
+		cmd := exec.Command(bin, "exec", "--", "git", "ls-remote", "https://github.com/other/repo.git")
+		cmd.Dir, cmd.Env = repo, env
+		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "'ssh' not allowed") {
+			t.Errorf("ls-remote: %v: %s", err, out)
+		}
+		// setup-git must hold without exec's environment too.
+		run("", bin, "setup-git")
+		if got := run("", "git", "remote", "get-url", "--push", "origin"); got != "https://github.com/acme/widgets.git" {
+			t.Errorf("setup-git push url = %q", got)
+		}
+		cmd = exec.Command("git", "ls-remote", "https://github.com/other/repo.git")
+		cmd.Dir, cmd.Env = repo, env
+		if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "'ssh' not allowed") {
+			t.Errorf("setup-git ls-remote: %v: %s", err, out)
+		}
+		run("", bin, "setup-git", "--undo")
+		cmd = exec.Command("git", "config", "--local", "core.sshCommand")
+		cmd.Dir, cmd.Env = repo, env
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Errorf("undo left core.sshCommand = %s", out)
+		}
+		run("", "git", "config", "--global", "--unset", key)
+		run("", "git", "config", "--global", "--unset", pushKey)
+		run("", "git", "remote", "set-url", "origin", "git@github.com:acme/widgets.git")
+	})
 	t.Run("exec git uses app credential, not the human's", func(t *testing.T) {
 		got := run("protocol=https\nhost=github.com\npath=acme/widgets.git\n\n", bin, "exec", "--", "git", "credential", "fill")
 		if !strings.Contains(got, "username=x-access-token") || !strings.Contains(got, "password=ghs_fake") {
 			t.Fatalf("credential fill = %q", got)
+		}
+	})
+	t.Run("exec explains permission failures and keeps the exit code", func(t *testing.T) {
+		gh := filepath.Join(tmp, "gh")
+		os.WriteFile(gh, []byte("#!/bin/sh\necho 'Resource not accessible by integration' >&2; exit 7\n"), 0o700)
+		cmd := exec.Command(bin, "exec", "--", gh, "run", "view", "1")
+		cmd.Dir, cmd.Env = repo, env
+		out, _ := cmd.CombinedOutput()
+		if cmd.ProcessState.ExitCode() != 7 || !strings.Contains(string(out), "Actions: read") ||
+			!strings.Contains(string(out), "/settings/apps/my-agent/permissions") {
+			t.Fatalf("exit %d: %s", cmd.ProcessState.ExitCode(), out)
+		}
+	})
+	t.Run("exec does not hang on background children", func(t *testing.T) {
+		start := time.Now()
+		cmd := exec.Command(bin, "exec", "--", "sh", "-c", "sleep 20 >/dev/null &")
+		cmd.Dir, cmd.Env = repo, env
+		// Own the outer pipe directly so only ghapp's own wait is measured.
+		f, err := os.Create(filepath.Join(tmp, "stderr"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		cmd.Stderr = f
+		if err := cmd.Run(); err != nil || time.Since(start) > 10*time.Second {
+			t.Fatalf("err %v after %s", err, time.Since(start))
 		}
 	})
 	t.Run("setup-git persists and commits as bot", func(t *testing.T) {
@@ -178,6 +245,172 @@ func TestEndToEnd(t *testing.T) {
 		got = run("protocol=https\nhost=github.com\npath=acme/widgets.git\n\n", "git", "credential", "fill")
 		if !strings.Contains(got, "HUMAN_TOKEN") {
 			t.Fatalf("after undo expected the human helper back, got %q", got)
+		}
+	})
+	localList := func() string {
+		out := run("", "git", "config", "--local", "--get-regexp", `^(user|core\.sshcommand|protocol|credential|url)`)
+		lines := strings.Split(out, "\n")
+		// Order matters only among values of the same key.
+		sort.SliceStable(lines, func(i, j int) bool {
+			a, _, _ := strings.Cut(lines[i], " ")
+			b, _, _ := strings.Cut(lines[j], " ")
+			return a < b
+		})
+		for i := range lines { // run trims trailing space from the last line only
+			lines[i] = strings.TrimRight(lines[i], " ")
+		}
+		return strings.Join(lines, "\n")
+	}
+	t.Run("inherited GIT_SSH_COMMAND cannot bypass the SSH block", func(t *testing.T) {
+		run("", bin, "setup-git")
+		defer run("", bin, "setup-git", "--undo")
+		for _, argv := range [][]string{
+			{"git", "ls-remote", "ssh://git@nohost.invalid/o/r"},
+			{"git", "ls-remote", "git+ssh://git@nohost.invalid/o/r"},
+			{bin, "exec", "--", "git", "ls-remote", "ssh://git@nohost.invalid/o/r"},
+		} {
+			cmd := exec.Command(argv[0], argv[1:]...)
+			cmd.Dir = repo
+			cmd.Env = append(append([]string{}, env...), "GIT_SSH_COMMAND=echo HUMAN_SSH_RAN >&2; exit 1 #")
+			if out, err := cmd.CombinedOutput(); err == nil || strings.Contains(string(out), "HUMAN_SSH_RAN") {
+				t.Errorf("%v: %v: %s", argv, err, out)
+			}
+		}
+	})
+	t.Run("undo restores the exact prior config", func(t *testing.T) {
+		run("", "git", "config", "user.name", "Human")
+		run("", "git", "config", "user.email", "human@example.com")
+		run("", "git", "config", "core.sshCommand", "ssh -i mine")
+		run("", "git", "config", "url.https://github.com/.insteadOf", "gh:")
+		run("", "git", "config", "credential.https://github.com.helper", "mine")
+		list := func() string {
+			l := strings.Split(run("", "git", "config", "--local", "--list"), "\n")
+			sort.Strings(l)
+			return strings.Join(l, "\n")
+		}
+		before := list()
+		run("", bin, "setup-git")
+		if got := run("", "git", "config", "--get-all", "url.https://github.com/.insteadOf"); !strings.Contains(got, "gh:") {
+			t.Errorf("setup dropped the repo's own URL rule: %q", got)
+		}
+		run("", bin, "setup-git") // repeat must not record its own values as prior
+		run("", "git", "remote", "set-url", "origin", "git@github.com:elsewhere/x.git")
+		run("", bin, "setup-git", "--undo")
+		run("", "git", "remote", "set-url", "origin", "git@github.com:acme/widgets.git")
+		if after := list(); after != before {
+			t.Errorf("before:\n%s\nafter:\n%s", before, after)
+		}
+		run("", bin, "setup-git", "--undo") // nothing recorded: must not touch anything
+		if after := list(); after != before {
+			t.Errorf("second undo changed config:\n%s", after)
+		}
+		// A value changed after setup belongs to the human.
+		run("", bin, "setup-git")
+		run("", "git", "config", "user.name", "Changed")
+		run("", bin, "setup-git", "--undo")
+		if got := run("", "git", "config", "user.name"); got != "Changed" {
+			t.Errorf("undo overwrote a later change: %q", got)
+		}
+	})
+	t.Run("undo of an unapplied record changes nothing", func(t *testing.T) {
+		record := filepath.Join(repo, ".git", "ghapp-setup.json")
+		run("", "git", "config", "--unset-all", "credential.https://github.com.helper")
+		run("", "git", "config", "--add", "credential.https://github.com.helper", "")
+		run("", "git", "config", "--add", "credential.https://github.com.helper", "mine")
+		before := localList()
+		run("", bin, "setup-git")
+		b, err := os.ReadFile(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		run("", bin, "setup-git", "--undo")
+		if err := os.WriteFile(record, b, 0o600); err != nil { // as if interrupted before applying
+			t.Fatal(err)
+		}
+		run("", bin, "setup-git", "--undo")
+		if after := localList(); after != before {
+			t.Errorf("before:\n%s\nafter:\n%s", before, after)
+		}
+	})
+	t.Run("undo can be retried after interruption at any point", func(t *testing.T) {
+		const key = "credential.https://github.com.helper"
+		record := filepath.Join(repo, ".git", "ghapp-setup.json")
+		set := func(vals ...string) {
+			t.Helper()
+			cmd := exec.Command("git", "config", "--unset-all", key)
+			cmd.Dir, cmd.Env = repo, env
+			cmd.Run() // may already be unset
+			for _, v := range vals {
+				run("", "git", "config", "--add", key, v)
+			}
+		}
+		prev := []string{"", "mine", "backup"}
+		set(prev...)
+		before := localList()
+		run("", bin, "setup-git")
+		b, err := os.ReadFile(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ours := "!'" + bin + "' git-credential"
+		if out := run("", "git", "config", "--get-all", key); !strings.Contains(out, "git-credential") {
+			t.Fatalf("helper = %q", out)
+		} else {
+			ours = out[strings.Index(out, "!"):]
+		}
+		run("", bin, "setup-git", "--undo")
+		// Restoration stopped after n values, or removal stopped midway.
+		for _, state := range [][]string{{}, prev[:1], prev[:2], prev, {"", ours}, {ours}} {
+			set(state...)
+			if err := os.WriteFile(record, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			run("", bin, "setup-git", "--undo")
+			if after := localList(); after != before {
+				t.Errorf("from %q\nbefore:\n%s\nafter:\n%s", state, before, after)
+			}
+		}
+		set("", "mine")
+	})
+	t.Run("concurrent setup and undo keep the original config", func(t *testing.T) {
+		before := localList()
+		var wg sync.WaitGroup
+		for i := range 6 {
+			wg.Go(func() {
+				args := []string{"setup-git"}
+				if i%3 == 2 {
+					args = append(args, "--undo")
+				}
+				cmd := exec.Command(bin, args...)
+				cmd.Dir, cmd.Env = repo, env
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Errorf("%v: %v: %s", args, err, out)
+				}
+			})
+		}
+		wg.Wait()
+		run("", bin, "setup-git", "--undo")
+		if after := localList(); after != before {
+			t.Errorf("before:\n%s\nafter:\n%s", before, after)
+		}
+		if _, err := os.Stat(filepath.Join(repo, ".git", "ghapp-setup.json.lock")); err == nil {
+			t.Error("lock left behind")
+		}
+	})
+	t.Run("undo cleans up after versions without a record", func(t *testing.T) {
+		run("", bin, "setup-git")
+		os.Remove(filepath.Join(repo, ".git", "ghapp-setup.json"))
+		run("", "git", "remote", "set-url", "origin", "git@github.com:elsewhere/x.git")
+		if out := run("", bin, "setup-git", "--undo"); !strings.Contains(out, "--unset-all protocol.ssh.allow") {
+			t.Errorf("leftover SSH block not reported: %s", out)
+		}
+		run("", "git", "config", "--unset-all", "protocol.ssh.allow")
+		run("", "git", "remote", "set-url", "origin", "git@github.com:acme/widgets.git")
+		got := run("", "git", "config", "--local", "--list")
+		for _, bad := range []string{"acme/.", "git-credential", "[bot]", "ssh is disabled"} {
+			if strings.Contains(strings.ToLower(got), bad) {
+				t.Errorf("left %q in:\n%s", bad, got)
+			}
 		}
 	})
 	t.Run("tokens are cached", func(t *testing.T) {
