@@ -141,8 +141,18 @@ func newClient(cfg *Config) (*client, error) {
 	}, nil
 }
 
-func (c *client) do(method, path, bearer string, out any) error {
-	req, err := http.NewRequest(method, c.cfg.APIURL+path, nil)
+// do sends body (if any) as JSON and decodes the reply into out; a *[]byte out
+// receives the raw reply.
+func (c *client) do(method, path, bearer string, body, out any) error {
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, c.cfg.APIURL+path, rdr)
 	if err != nil {
 		return err
 	}
@@ -156,12 +166,23 @@ func (c *client) do(method, path, bearer string, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(b)))
+		err := fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, strings.TrimSpace(string(b)))
+		if p := resp.Header.Get("X-Accepted-GitHub-Permissions"); p != "" && resp.StatusCode == 403 {
+			err = fmt.Errorf("%w\nghapp: GitHub says this needs: %s; run `ghapp doctor` to see where to grant it", err, p)
+		}
+		return err
+	}
+	if raw, ok := out.(*[]byte); ok {
+		*raw = b
+		return nil
 	}
 	if out != nil {
-		return json.NewDecoder(bytes.NewReader(b)).Decode(out)
+		return json.Unmarshal(b, out)
 	}
 	return nil
 }
@@ -184,7 +205,7 @@ func (c *client) installationID(owner, repo string) (string, error) {
 		ID int64 `json:"id"`
 	}
 	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) + "/installation"
-	if err := c.do("GET", path, j, &inst); err != nil {
+	if err := c.do("GET", path, j, nil, &inst); err != nil {
 		return "", fmt.Errorf("is the app installed on %s/%s? %w", owner, repo, err)
 	}
 	return strconv.FormatInt(inst.ID, 10), nil
@@ -195,13 +216,17 @@ type token struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+func (c *client) tokenCache(id string) string {
+	return filepath.Join(c.cacheDir, "token-"+c.cfg.AppID+"-"+id+".json")
+}
+
 // installationToken returns a cached token if it has >5 minutes left, else mints one.
 func (c *client) installationToken(owner, repo string) (*token, error) {
 	id, err := c.installationID(owner, repo)
 	if err != nil {
 		return nil, err
 	}
-	cachePath := filepath.Join(c.cacheDir, "token-"+c.cfg.AppID+"-"+id+".json")
+	cachePath := c.tokenCache(id)
 	var t token
 	if readCache(cachePath, &t) && t.ExpiresAt.After(c.now().Add(5*time.Minute)) {
 		return &t, nil
@@ -210,7 +235,7 @@ func (c *client) installationToken(owner, repo string) (*token, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := c.do("POST", "/app/installations/"+id+"/access_tokens", j, &t); err != nil {
+	if err := c.do("POST", "/app/installations/"+id+"/access_tokens", j, nil, &t); err != nil {
 		return nil, err
 	}
 	writeCache(cachePath, t)
@@ -236,14 +261,14 @@ func (c *client) botIdentity() (*identity, error) {
 	var app struct {
 		Slug string `json:"slug"`
 	}
-	if err := c.do("GET", "/app", j, &app); err != nil {
+	if err := c.do("GET", "/app", j, nil, &app); err != nil {
 		return nil, err
 	}
 	login := app.Slug + "[bot]"
 	var user struct {
 		ID int64 `json:"id"`
 	}
-	if err := c.do("GET", "/users/"+url.PathEscape(login), "", &user); err != nil {
+	if err := c.do("GET", "/users/"+url.PathEscape(login), "", nil, &user); err != nil {
 		return nil, err
 	}
 	id = identity{Name: login, Email: fmt.Sprintf("%d+%s@users.noreply.%s", user.ID, login, c.cfg.Host)}

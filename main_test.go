@@ -164,6 +164,30 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("credential fill = %q", got)
 		}
 	})
+	t.Run("exec explains permission failures and keeps the exit code", func(t *testing.T) {
+		cmd := exec.Command(bin, "exec", "--", "sh", "-c", "echo 'Resource not accessible by integration' >&2; exit 7 # gh run view")
+		cmd.Dir, cmd.Env = repo, env
+		out, _ := cmd.CombinedOutput()
+		if cmd.ProcessState.ExitCode() != 7 || !strings.Contains(string(out), "Actions: read") ||
+			!strings.Contains(string(out), "/settings/apps/my-agent/permissions") {
+			t.Fatalf("exit %d: %s", cmd.ProcessState.ExitCode(), out)
+		}
+	})
+	t.Run("exec does not hang on background children", func(t *testing.T) {
+		start := time.Now()
+		cmd := exec.Command(bin, "exec", "--", "sh", "-c", "sleep 20 >/dev/null &")
+		cmd.Dir, cmd.Env = repo, env
+		// Own the outer pipe directly so only ghapp's own wait is measured.
+		f, err := os.Create(filepath.Join(tmp, "stderr"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		cmd.Stderr = f
+		if err := cmd.Run(); err != nil || time.Since(start) > 10*time.Second {
+			t.Fatalf("err %v after %s", err, time.Since(start))
+		}
+	})
 	t.Run("setup-git persists and commits as bot", func(t *testing.T) {
 		run("", bin, "setup-git")
 		got := run("protocol=https\nhost=github.com\npath=acme/widgets.git\n\n", "git", "credential", "fill")

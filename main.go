@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const usage = `ghapp — act as a GitHub App for git and gh
@@ -18,6 +19,9 @@ const usage = `ghapp — act as a GitHub App for git and gh
 Usage:
   ghapp exec -- <cmd> [args...]   run cmd with the app's token and bot identity
                                   (e.g. ghapp exec -- git push; ghapp exec -- gh pr create)
+  ghapp read <resource> <owner>/<repo> [number|ref]
+                                  fetch PR, issue, or CI data; GET only, read-only token
+  ghapp doctor [owner/repo]       list granted and missing app permissions
   ghapp setup-git [--undo]        make plain git in this repo commit/push as the app
   ghapp token [owner/repo]        print an installation token
   ghapp whoami                    print the app's bot name and email
@@ -85,6 +89,14 @@ func run(args []string) error {
 			return errors.New("ghapp exec: missing command")
 		}
 		return execAs(c, cmd)
+	case "read":
+		return read(c, args[1:], os.Stdout)
+	case "doctor":
+		owner, repo := originRepo(cfg.Host)
+		if len(args) > 1 {
+			owner, repo, _ = strings.Cut(args[1], "/")
+		}
+		return doctor(c, owner, repo, os.Stdout)
 	case "setup-git":
 		return setupGit(c, len(args) > 1 && args[1] == "--undo")
 	}
@@ -172,7 +184,36 @@ func execAs(c *client, argv []string) error {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = env
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd.Run()
+	if fi, err := os.Stderr.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		return cmd.Run() // a human's terminal: keep progress bars and prompts working
+	}
+	// Agents run without a terminal; watch stderr so permission failures get explained.
+	tail := &tailWriter{}
+	cmd.Stderr = io.MultiWriter(os.Stderr, tail)
+	// Don't hang on background children (git maintenance) that inherit stderr.
+	cmd.WaitDelay = 2 * time.Second
+	err = cmd.Run()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		err = nil
+	}
+	if err != nil {
+		if h := c.hint(argv, string(tail.b)); h != "" {
+			fmt.Fprintln(os.Stderr, h)
+		}
+	}
+	return err
+}
+
+// tailWriter keeps the last 64 KiB written to it.
+type tailWriter struct{ b []byte }
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	const limit = 64 << 10
+	w.b = append(w.b, p...)
+	if len(w.b) > limit {
+		w.b = append([]byte(nil), w.b[len(w.b)-limit:]...)
+	}
+	return len(p), nil
 }
 
 func setupGit(c *client, undo bool) error {
